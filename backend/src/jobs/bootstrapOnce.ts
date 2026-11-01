@@ -1,0 +1,135 @@
+/**
+ * bootstrapOnce — run-once startup bootstrap for FRESH deploys.
+ *
+ * A newly deployed backend starts with an empty SQLite file: no facilities,
+ * no detections, so every dashboard surface renders zeroes until the 15-min
+ * cron happens to land (and facility ingestion NEVER runs — it is a manual
+ * CLI job, not scheduled). This module fixes first-paint emptiness:
+ *
+ *   1. user_facilities empty + seed CSV shipped in the image → ingest it.
+ *   2. firms_detections empty → run one live FIRMS refresh + matching now.
+ *   3. detections below the backfill threshold → re-hydrate the FIRMS
+ *      archive (ARCHIVE_BACKFILL_DAYS, default 10) so a free-plan host that
+ *      wipes its disk on every spin-down still boots with real history —
+ *      classifications/baselines come back within a minute, not a day.
+ *
+ * It never blocks server start (server.ts fires it without awaiting) and
+ * never runs twice per process. Failures are logged, not thrown — the
+ * scheduled pipeline is the safety net.
+ */
+
+import fs from "node:fs";
+import path from "node:path";
+import { db, getAllUserFacilities, getCoverage } from "../db/client.js";
+import { env } from "../config/env.js";
+import { ingestUserDataset } from "./ingestUserDataset.js";
+import { refreshLive } from "./refreshLiveFirms.js";
+import { ingestArchive } from "./ingestFirmsArchive.js";
+import { runMatchingJob } from "./runMatching.js";
+import { httpRequest } from "../lib/http.js";
+import { ingestLog as log } from "../lib/logger.js";
+
+let started = false;
+
+export function bootstrapOnce(): void {
+  if (started) return;
+  started = true;
+
+  void (async () => {
+    // 1. Seed the facility master list when the table is empty.
+    if (getAllUserFacilities().length === 0) {
+      const csvPath = path.resolve(process.cwd(), "data/user_facilities.csv");
+      if (fs.existsSync(csvPath)) {
+        try {
+          await ingestUserDataset();
+          log.info({ rows: getAllUserFacilities().length }, "bootstrap: user facilities seeded");
+        } catch (err) {
+          log.error({ err: String(err) }, "bootstrap: user facility seeding failed");
+        }
+      } else {
+        log.warn({ csvPath }, "bootstrap: no facilities in DB and seed CSV missing");
+      }
+    }
+
+    // 2. First FIRMS refresh so the map/dashboard has detections on arrival.
+    const coverage = getCoverage();
+    if (coverage.rows === 0) {
+      try {
+        const { inserted } = await refreshLive();
+        log.info({ inserted }, "bootstrap: first live refresh done");
+        if (inserted > 0) {
+          const matchResult = await runMatchingJob();
+          log.info(matchResult, "bootstrap: first matching done");
+        }
+      } catch (err) {
+        log.error({ err: String(err) }, "bootstrap: first refresh failed (15-min cron will retry)");
+      }
+    } else {
+      log.info({ rows: coverage.rows }, "bootstrap: detections already present — skipping seed refresh");
+    }
+
+    // 3. Archive backfill — keeps a disk-wiped (free-plan) deployment useful
+    // immediately after every spin-up. Skipped when ARCHIVE_BACKFILL_DAYS=0
+    // or the stored history is already deep enough (persisted disk / lucky
+    // warm boot). Depth is measured by DATE SPAN, not row count: two days of
+    // live global data already yield ~90k rows, which would defeat any sane
+    // row-count threshold while still lacking baseline history.
+    const afterRefresh = getCoverage();
+    const spanDays =
+      afterRefresh.minDate && afterRefresh.maxDate
+        ? Math.round(
+            (new Date(afterRefresh.maxDate).getTime() - new Date(afterRefresh.minDate).getTime()) / 86_400_000,
+          )
+        : 0;
+    const shallowSpan = spanDays < env.ARCHIVE_BACKFILL_DAYS - 1;
+    if (env.ARCHIVE_BACKFILL_DAYS > 0 && (afterRefresh.rows < env.ARCHIVE_BACKFILL_MIN_ROWS || shallowSpan)) {
+      try {
+        log.info(
+          {
+            days: env.ARCHIVE_BACKFILL_DAYS,
+            minRows: env.ARCHIVE_BACKFILL_MIN_ROWS,
+            coverage: afterRefresh,
+            spanDays,
+            shallowSpan,
+          },
+          "bootstrap: history shallower than target — starting archive backfill",
+        );
+        await ingestArchive(env.ARCHIVE_BACKFILL_DAYS);
+        const matchResult = await runMatchingJob();
+        log.info(
+          { coverage: getCoverage(), matchResult },
+          "bootstrap: archive backfill + matching done",
+        );
+      } catch (err) {
+        log.error({ err: String(err) }, "bootstrap: archive backfill failed (15-min cron keeps live data flowing)");
+      }
+    }
+
+    // 4. Pre-warm the ML service (fire-and-forget, long budget). On the free
+    // plan the two Render services spin down independently, so the FIRST
+    // /api/predict or /api/ml/* request after a backend-only wake otherwise
+    // pays ML's ~120s cold start on top of the user's wait. Pinging /health
+    // here wakes ML while this backend is still doing its own bootstrap, so
+    // the two cold starts overlap instead of stacking.
+    void (async () => {
+      const started = Date.now();
+      try {
+        const { status } = await httpRequest(
+          `${env.ML_API_BASE_URL.replace(/\/+$/, "")}/health`,
+          {},
+          { timeoutMs: 300_000 }, // ML cold start measured >120s
+        );
+        log.info({ status, ms: Date.now() - started }, "bootstrap: ML pre-warm done");
+      } catch (err) {
+        log.warn(
+          { err: String(err), ms: Date.now() - started },
+          "bootstrap: ML pre-warm failed (first ML request will pay the cold start)",
+        );
+      }
+    })();
+  })();
+}
+
+// Re-exported read so server.ts can log what bootstrap found without
+// touching db/ internals directly.
+export { db };

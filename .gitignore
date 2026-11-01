@@ -1,0 +1,88 @@
+# Dependencies
+node_modules/
+/.pnp
+.pnp.*
+.yarn/*
+!.yarn/patches
+!.yarn/plugins
+!.yarn/releases
+!.yarn/versions
+
+# Environment variables
+.env
+.env.*
+# Env TEMPLATES must ship with the repo (Step 4 durability fix)
+!.env.example
+.env.examples
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# Database files
+# Contents only — the seed CSV inside must stay tracked (Dockerfile COPYs it;
+# untracked, every Render build from a pristine clone fails at COPY).
+backend/data/*
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+
+# Next.js build output
+frontend/.next/
+frontend/out/
+
+# Backend build output
+backend/dist/
+backend/build/
+
+# Testing
+coverage/
+
+# Python bytecode / caches (previously leaked into git — 36 tracked .pyc files)
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# IDEs and Editors
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.project
+.settings/
+
+# Misc
+*.pem
+.vercel/
+*.tsbuildinfo
+next-env.d.ts
+.uv-bin/
+.uv-pythons/
+.venv-model/
+.gstack/
+
+# Phase 1: keep raw datasets out of data_science/
+data_science/**/*.npy
+data_science/**/raw_data/
+
+# Frozen historical CSV is data, not code — keep the template, ignore the real one.
+data/historical_hotspots.csv
